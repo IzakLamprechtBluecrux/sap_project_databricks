@@ -1,0 +1,15 @@
+import sys
+
+sys.path.append("/Workspace/Users/izak.lamprecht@bluecrux.com/sap_project_databricks/src")
+
+from data_contract_pipeline import run_pipeline
+
+
+CONTRACT_PATH = (
+    "/Workspace/Repos/your_user/sap-data-pipelines/contracts/mara.yml"
+)
+
+run_pipeline(
+    spark=spark,
+    contract_path=CONTRACT_PATH
+)
