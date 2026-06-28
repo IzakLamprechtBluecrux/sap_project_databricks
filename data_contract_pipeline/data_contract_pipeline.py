@@ -1,5 +1,4 @@
 import yaml
-
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, to_date, to_timestamp
 from pyspark.sql.types import (
@@ -16,27 +15,65 @@ from pyspark.sql.types import (
 
 
 class DataContractError(Exception):
-    pass
+    """Raised when one or more data contract checks fail."""
 
+
+# ============================================================
+# YAML loading
+# ============================================================
 
 def load_yaml_contract(contract_path: str) -> dict:
     with open(contract_path, "r") as file:
         return yaml.safe_load(file)
 
 
+# ============================================================
+# Contract helpers
+# ============================================================
+
 def get_expected_columns(contract: dict) -> list[str]:
-    return [column["name"] for column in contract["columns"]]
+    columns = contract.get("columns", [])
+    ordered_columns = sorted(
+        columns,
+        key=lambda column: column.get("ordinal_position", 999999)
+    )
+    return [column["name"] for column in ordered_columns]
 
 
 def get_column_type_map(contract: dict) -> dict:
     return {
         column["name"]: column["type"]
-        for column in contract["columns"]
-        if "type" in column
+        for column in contract.get("columns", [])
+        if "name" in column and "type" in column
     }
 
 
+def get_column_format_map(contract: dict) -> dict:
+    return {
+        column["name"]: column["format"]
+        for column in contract.get("columns", [])
+        if "name" in column and "format" in column
+    }
+
+
+def get_primary_key_columns(contract: dict) -> list[str]:
+    if "primary_key" in contract:
+        return contract["primary_key"]
+
+    table_config = contract.get("table", {})
+    if "primary_key" in table_config:
+        return table_config["primary_key"]
+
+    return [
+        column["name"]
+        for column in contract.get("columns", [])
+        if column.get("key_part") is True
+    ]
+
+
 def get_spark_type(type_name: str):
+    clean_type = type_name.lower().strip()
+
     type_mapping = {
         "string": StringType(),
         "integer": IntegerType(),
@@ -50,8 +87,6 @@ def get_spark_type(type_name: str):
         "date": DateType(),
         "timestamp": TimestampType(),
     }
-
-    clean_type = type_name.lower().strip()
 
     if clean_type not in type_mapping:
         raise DataContractError(f"Unsupported data type in contract: {type_name}")
@@ -71,6 +106,10 @@ def build_schema_name(table_config: dict) -> str:
     return f"{table_config['catalog']}.{table_config['schema']}"
 
 
+# ============================================================
+# Validation checks
+# ============================================================
+
 def validate_schema(df: DataFrame, contract: dict) -> list[str]:
     errors = []
 
@@ -78,15 +117,18 @@ def validate_schema(df: DataFrame, contract: dict) -> list[str]:
     expected_columns = get_expected_columns(contract)
 
     schema_rules = contract.get("schema_enforcement", {})
-
-    expected_field_count = schema_rules.get(
-        "expected_field_count",
-        len(expected_columns)
-    )
-
+    expected_field_count = schema_rules.get("expected_field_count", len(expected_columns))
     allow_extra_columns = schema_rules.get("allow_extra_columns", False)
     allow_missing_columns = schema_rules.get("allow_missing_columns", False)
     enforce_column_order = schema_rules.get("enforce_column_order", False)
+    case_sensitive_columns = schema_rules.get("case_sensitive_columns", True)
+
+    if not case_sensitive_columns:
+        actual_compare = [column.lower() for column in actual_columns]
+        expected_compare = [column.lower() for column in expected_columns]
+    else:
+        actual_compare = actual_columns
+        expected_compare = expected_columns
 
     if len(actual_columns) != expected_field_count:
         errors.append(
@@ -94,42 +136,55 @@ def validate_schema(df: DataFrame, contract: dict) -> list[str]:
             f"but found {len(actual_columns)}."
         )
 
-    missing_columns = set(expected_columns) - set(actual_columns)
+    missing_columns = set(expected_compare) - set(actual_compare)
     if missing_columns and not allow_missing_columns:
         errors.append(f"Missing columns: {sorted(missing_columns)}.")
 
-    extra_columns = set(actual_columns) - set(expected_columns)
+    extra_columns = set(actual_compare) - set(expected_compare)
     if extra_columns and not allow_extra_columns:
         errors.append(f"Unexpected columns: {sorted(extra_columns)}.")
 
-    if enforce_column_order and actual_columns != expected_columns:
-        errors.append(
-            "Column order mismatch. Source column order does not match contract."
-        )
+    if enforce_column_order and actual_compare != expected_compare:
+        errors.append("Column order mismatch. Source column order does not match contract.")
 
     return errors
 
 
-def validate_date_rules(df: DataFrame, contract: dict) -> list[str]:
+def validate_date_and_timestamp_formats(df: DataFrame, contract: dict) -> list[str]:
     errors = []
+    format_map = get_column_format_map(contract)
+    type_map = get_column_type_map(contract)
 
-    for column_name, date_format in contract.get("date_rules", {}).items():
+    for column_name, expected_format in format_map.items():
         if column_name not in df.columns:
-            errors.append(f"Date column '{column_name}' is missing.")
+            errors.append(f"Formatted column '{column_name}' is missing.")
             continue
 
-        invalid_count = (
-            df.filter(
-                col(column_name).isNotNull()
-                & to_date(col(column_name).cast("string"), date_format).isNull()
+        column_type = type_map.get(column_name, "string").lower().strip()
+
+        if column_type == "date":
+            invalid_count = (
+                df.filter(
+                    col(column_name).isNotNull()
+                    & to_date(col(column_name).cast("string"), expected_format).isNull()
+                )
+                .count()
             )
-            .count()
-        )
+        elif column_type == "timestamp":
+            invalid_count = (
+                df.filter(
+                    col(column_name).isNotNull()
+                    & to_timestamp(col(column_name).cast("string"), expected_format).isNull()
+                )
+                .count()
+            )
+        else:
+            continue
 
         if invalid_count > 0:
             errors.append(
-                f"Date format failed for '{column_name}'. "
-                f"Expected format: {date_format}. "
+                f"Format check failed for '{column_name}'. "
+                f"Expected format: {expected_format}. "
                 f"Invalid records: {invalid_count}."
             )
 
@@ -139,7 +194,7 @@ def validate_date_rules(df: DataFrame, contract: dict) -> list[str]:
 def validate_nullable_rules(df: DataFrame, contract: dict) -> list[str]:
     errors = []
 
-    for column_def in contract["columns"]:
+    for column_def in contract.get("columns", []):
         column_name = column_def["name"]
         nullable = column_def.get("nullable", True)
 
@@ -157,13 +212,12 @@ def validate_nullable_rules(df: DataFrame, contract: dict) -> list[str]:
 
 def validate_primary_key_rules(df: DataFrame, contract: dict) -> list[str]:
     errors = []
-    primary_keys = contract.get("primary_key", [])
+    primary_keys = get_primary_key_columns(contract)
 
     if not primary_keys:
         return errors
 
     missing_keys = [key for key in primary_keys if key not in df.columns]
-
     if missing_keys:
         errors.append(f"Primary key columns missing: {missing_keys}.")
         return errors
@@ -178,7 +232,7 @@ def validate_primary_key_rules(df: DataFrame, contract: dict) -> list[str]:
         )
 
     duplicate_key_count = (
-        df.groupBy(primary_keys)
+        df.groupBy(*primary_keys)
         .count()
         .filter(col("count") > 1)
         .count()
@@ -197,7 +251,7 @@ def validate_data_contract(df: DataFrame, contract: dict) -> None:
     errors = []
 
     errors.extend(validate_schema(df, contract))
-    errors.extend(validate_date_rules(df, contract))
+    errors.extend(validate_date_and_timestamp_formats(df, contract))
     errors.extend(validate_nullable_rules(df, contract))
     errors.extend(validate_primary_key_rules(df, contract))
 
@@ -207,47 +261,41 @@ def validate_data_contract(df: DataFrame, contract: dict) -> None:
         )
 
 
+# ============================================================
+# Transformation and write
+# ============================================================
+
+def select_contract_columns(df: DataFrame, contract: dict) -> DataFrame:
+    expected_columns = get_expected_columns(contract)
+    return df.select(*[col(column_name) for column_name in expected_columns])
+
+
 def apply_column_types(df: DataFrame, contract: dict) -> DataFrame:
     column_type_map = get_column_type_map(contract)
-    date_rules = contract.get("date_rules", {})
-    timestamp_rules = contract.get("timestamp_rules", {})
+    format_map = get_column_format_map(contract)
 
     for column_name, type_name in column_type_map.items():
-
         if column_name not in df.columns:
             raise DataContractError(f"Cannot cast missing column: {column_name}")
 
         spark_type = get_spark_type(type_name)
 
         if isinstance(spark_type, DateType):
-            date_format = date_rules.get(column_name, "yyyyMMdd")
+            date_format = format_map.get(column_name, "yyyyMMdd")
             df = df.withColumn(
                 column_name,
                 to_date(col(column_name).cast("string"), date_format)
             )
-
         elif isinstance(spark_type, TimestampType):
-            timestamp_format = timestamp_rules.get(
-                column_name,
-                "yyyy-MM-dd HH:mm:ss"
-            )
+            timestamp_format = format_map.get(column_name, "yyyy-MM-dd HH:mm:ss")
             df = df.withColumn(
                 column_name,
                 to_timestamp(col(column_name).cast("string"), timestamp_format)
             )
-
         else:
-            df = df.withColumn(
-                column_name,
-                col(column_name).cast(spark_type)
-            )
+            df = df.withColumn(column_name, col(column_name).cast(spark_type))
 
     return df
-
-
-def select_contract_columns(df: DataFrame, contract: dict) -> DataFrame:
-    expected_columns = get_expected_columns(contract)
-    return df.select(*[col(column_name) for column_name in expected_columns])
 
 
 def run_data_contract_pipeline(
@@ -255,7 +303,6 @@ def run_data_contract_pipeline(
     contract_path: str,
     write_mode: str = "overwrite"
 ) -> None:
-
     print(f"Loading data contract: {contract_path}")
     contract = load_yaml_contract(contract_path)
 
