@@ -1,0 +1,149 @@
+import yaml
+
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, to_date
+from pyspark.sql.types import (
+    StringType,
+    IntegerType,
+    LongType,
+    DoubleType,
+    DecimalType,
+    DateType,
+    TimestampType
+)
+
+
+class DataContractError(Exception):
+    pass
+
+
+def load_yaml_contract(contract_path: str) -> dict:
+    with open(contract_path, "r") as file:
+        return yaml.safe_load(file)
+
+
+def get_spark_type(type_name: str):
+    type_mapping = {
+        "string": StringType(),
+        "integer": IntegerType(),
+        "int": IntegerType(),
+        "long": LongType(),
+        "double": DoubleType(),
+        "decimal": DecimalType(18, 2),
+        "date": DateType(),
+        "timestamp": TimestampType()
+    }
+
+    clean_type = type_name.lower()
+
+    if clean_type not in type_mapping:
+        raise DataContractError(f"Unsupported data type: {type_name}")
+
+    return type_mapping[clean_type]
+
+
+def validate_data_contract(df: DataFrame, contract: dict) -> None:
+    errors = []
+
+    actual_columns = df.columns
+    expected_columns = contract["expected_columns"]
+    expected_field_count = contract["expected_field_count"]
+
+    if len(actual_columns) != expected_field_count:
+        errors.append(
+            f"Field count mismatch. Expected {expected_field_count}, "
+            f"but found {len(actual_columns)}."
+        )
+
+    missing_columns = set(expected_columns) - set(actual_columns)
+    if missing_columns:
+        errors.append(f"Missing columns: {sorted(missing_columns)}.")
+
+    extra_columns = set(actual_columns) - set(expected_columns)
+    if extra_columns:
+        errors.append(f"Unexpected columns: {sorted(extra_columns)}.")
+
+    for date_column, date_format in contract.get("date_rules", {}).items():
+        if date_column not in actual_columns:
+            errors.append(f"Date column '{date_column}' is missing.")
+        else:
+            invalid_count = (
+                df.filter(
+                    col(date_column).isNotNull()
+                    & to_date(col(date_column).cast("string"), date_format).isNull()
+                )
+                .count()
+            )
+
+            if invalid_count > 0:
+                errors.append(
+                    f"Date format failed for '{date_column}'. "
+                    f"Expected {date_format}. "
+                    f"Invalid records: {invalid_count}."
+                )
+
+    if errors:
+        raise DataContractError(
+            "Data contract validation failed:\n- " + "\n- ".join(errors)
+        )
+
+
+def apply_column_types(df: DataFrame, contract: dict) -> DataFrame:
+    column_type_map = contract.get("column_type_map", {})
+    date_rules = contract.get("date_rules", {})
+
+    for column_name, type_name in column_type_map.items():
+        if column_name not in df.columns:
+            raise DataContractError(f"Cannot cast missing column: {column_name}")
+
+        spark_type = get_spark_type(type_name)
+
+        if isinstance(spark_type, DateType):
+            date_format = date_rules.get(column_name, "yyyyMMdd")
+            df = df.withColumn(
+                column_name,
+                to_date(col(column_name).cast("string"), date_format)
+            )
+        else:
+            df = df.withColumn(
+                column_name,
+                col(column_name).cast(spark_type)
+            )
+
+    return df
+
+
+def run_pipeline(spark, contract_path: str) -> None:
+    contract = load_yaml_contract(contract_path)
+
+    source = contract["source"]
+    target = contract["target"]
+
+    source_table = f"{source['catalog']}.{source['schema']}.{source['table']}"
+    target_table = f"{target['catalog']}.{target['schema']}.{target['table']}"
+    target_schema = f"{target['catalog']}.{target['schema']}"
+
+    print(f"Reading source table: {source_table}")
+    source_df = spark.table(source_table)
+
+    print("Running data contract checks")
+    validate_data_contract(source_df, contract)
+
+    print("Data contract passed")
+
+    print("Applying target data types")
+    typed_df = apply_column_types(source_df, contract)
+
+    print(f"Creating target schema if needed: {target_schema}")
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_schema}")
+
+    print(f"Writing target table: {target_table}")
+    (
+        typed_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(target_table)
+    )
+
+    print("Pipeline completed successfully")
