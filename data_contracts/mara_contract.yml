@@ -5,6 +5,10 @@ owner:
   team: data_engineering
   business_owner: material_master
   technical_owner: databricks_pipeline
+sla:
+  refresh: daily
+  criticality: High
+business_domain: SAP MM
 table:
   name: MARA
   domain: SAP Material Master
