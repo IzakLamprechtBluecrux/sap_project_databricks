@@ -1,15 +1,16 @@
 import sys
 
-sys.path.append("/Workspace/Repos/izak.lamprecht@bluecrux.com/sap_project_databricks/pipelines")
+REPO_ROOT = "/Workspace/Repos/izak.lamprecht@bluecrux.com/sap_project_databricks"
+
+sys.path.append(f"{REPO_ROOT}/data_contract_pipeline")
 
 from mara_data_contract_pipeline import run_pipeline
 
 
-CONTRACT_PATH = (
-    "/Workspace/Repos/izak.lamprecht@bluecrux.com/sap_project_databricks/data_contracts/mara_contract.yml"
-)
+CONTRACT_PATH = f"{REPO_ROOT}/contracts/mara_contract.yml"
 
 run_pipeline(
     spark=spark,
-    contract_path=CONTRACT_PATH
+    contract_path=CONTRACT_PATH,
+    write_mode="overwrite"
 )
