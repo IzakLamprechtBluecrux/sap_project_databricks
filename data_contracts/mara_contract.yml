@@ -1,14 +1,14 @@
 table_name: MARA
 
 source:
-  catalog: main
-  schema: sap_raw
+  catalog: workspace
+  schema: sap_bronze
   table: MARA
 
 target:
-  catalog: main
-  schema: sap_curated
-  table: MARA
+  catalog: workspace
+  schema: sap_gold
+  table: MARA_DP_NEW
 
 expected_field_count: 296
 
