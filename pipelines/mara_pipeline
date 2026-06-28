@@ -1,12 +1,12 @@
 import sys
 
-sys.path.append("/Workspace/Users/izak.lamprecht@bluecrux.com/sap_project_databricks/src")
+sys.path.append("/Workspace/Repos/izak.lamprecht@bluecrux.com/sap_project_databricks/pipelines")
 
-from data_contract_pipeline import run_pipeline
+from mara_data_contract_pipeline import run_pipeline
 
 
 CONTRACT_PATH = (
-    "/Workspace/Repos/your_user/sap-data-pipelines/contracts/mara.yml"
+    "/Workspace/Repos/izak.lamprecht@bluecrux.com/sap_project_databricks/data_contracts/mara_contract.yml"
 )
 
 run_pipeline(
