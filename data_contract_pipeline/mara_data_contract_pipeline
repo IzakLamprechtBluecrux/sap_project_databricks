@@ -1,15 +1,16 @@
 import yaml
-
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, to_date
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import col, to_date, to_timestamp
 from pyspark.sql.types import (
     StringType,
     IntegerType,
     LongType,
     DoubleType,
+    FloatType,
     DecimalType,
+    BooleanType,
     DateType,
-    TimestampType
+    TimestampType,
 )
 
 
@@ -22,32 +23,69 @@ def load_yaml_contract(contract_path: str) -> dict:
         return yaml.safe_load(file)
 
 
+def get_expected_columns(contract: dict) -> list[str]:
+    return [column["name"] for column in contract["columns"]]
+
+
+def get_column_type_map(contract: dict) -> dict:
+    return {
+        column["name"]: column["type"]
+        for column in contract["columns"]
+        if "type" in column
+    }
+
+
 def get_spark_type(type_name: str):
+    clean_type = type_name.lower().strip()
+
     type_mapping = {
         "string": StringType(),
         "integer": IntegerType(),
         "int": IntegerType(),
         "long": LongType(),
+        "bigint": LongType(),
         "double": DoubleType(),
+        "float": FloatType(),
         "decimal": DecimalType(18, 2),
+        "boolean": BooleanType(),
         "date": DateType(),
-        "timestamp": TimestampType()
+        "timestamp": TimestampType(),
     }
 
-    clean_type = type_name.lower()
-
     if clean_type not in type_mapping:
-        raise DataContractError(f"Unsupported data type: {type_name}")
+        raise DataContractError(f"Unsupported data type in contract: {type_name}")
 
     return type_mapping[clean_type]
 
 
-def validate_data_contract(df: DataFrame, contract: dict) -> None:
+def build_table_name(table_config: dict) -> str:
+    return (
+        f"{table_config['catalog']}."
+        f"{table_config['schema']}."
+        f"{table_config['table']}"
+    )
+
+
+def build_schema_name(table_config: dict) -> str:
+    return f"{table_config['catalog']}.{table_config['schema']}"
+
+
+def validate_schema(df: DataFrame, contract: dict) -> list[str]:
     errors = []
 
     actual_columns = df.columns
-    expected_columns = contract["expected_columns"]
-    expected_field_count = contract["expected_field_count"]
+    expected_columns = get_expected_columns(contract)
+
+    schema_rules = contract.get("schema_enforcement", {})
+
+    expected_field_count = schema_rules.get(
+        "expected_field_count",
+        len(expected_columns)
+    )
+
+    allow_extra_columns = schema_rules.get("allow_extra_columns", False)
+    allow_missing_columns = schema_rules.get("allow_missing_columns", False)
+    enforce_column_order = schema_rules.get("enforce_column_order", False)
 
     if len(actual_columns) != expected_field_count:
         errors.append(
@@ -56,31 +94,112 @@ def validate_data_contract(df: DataFrame, contract: dict) -> None:
         )
 
     missing_columns = set(expected_columns) - set(actual_columns)
-    if missing_columns:
+    if missing_columns and not allow_missing_columns:
         errors.append(f"Missing columns: {sorted(missing_columns)}.")
 
     extra_columns = set(actual_columns) - set(expected_columns)
-    if extra_columns:
+    if extra_columns and not allow_extra_columns:
         errors.append(f"Unexpected columns: {sorted(extra_columns)}.")
 
-    for date_column, date_format in contract.get("date_rules", {}).items():
-        if date_column not in actual_columns:
-            errors.append(f"Date column '{date_column}' is missing.")
-        else:
-            invalid_count = (
-                df.filter(
-                    col(date_column).isNotNull()
-                    & to_date(col(date_column).cast("string"), date_format).isNull()
-                )
-                .count()
+    if enforce_column_order and actual_columns != expected_columns:
+        errors.append("Column order mismatch. Source column order does not match contract.")
+
+    return errors
+
+
+def validate_date_rules(df: DataFrame, contract: dict) -> list[str]:
+    errors = []
+    actual_columns = df.columns
+
+    for column_name, date_format in contract.get("date_rules", {}).items():
+        if column_name not in actual_columns:
+            errors.append(f"Date column '{column_name}' is missing.")
+            continue
+
+        invalid_count = (
+            df.filter(
+                col(column_name).isNotNull()
+                & to_date(col(column_name).cast("string"), date_format).isNull()
+            )
+            .count()
+        )
+
+        if invalid_count > 0:
+            errors.append(
+                f"Date format failed for '{column_name}'. "
+                f"Expected format: {date_format}. "
+                f"Invalid records: {invalid_count}."
             )
 
-            if invalid_count > 0:
+    return errors
+
+
+def validate_nullable_rules(df: DataFrame, contract: dict) -> list[str]:
+    errors = []
+
+    for column_def in contract["columns"]:
+        column_name = column_def["name"]
+        nullable = column_def.get("nullable", True)
+
+        if nullable is False and column_name in df.columns:
+            null_count = df.filter(col(column_name).isNull()).count()
+
+            if null_count > 0:
                 errors.append(
-                    f"Date format failed for '{date_column}'. "
-                    f"Expected {date_format}. "
-                    f"Invalid records: {invalid_count}."
+                    f"Null check failed for '{column_name}'. "
+                    f"Null records found: {null_count}."
                 )
+
+    return errors
+
+
+def validate_primary_key_rules(df: DataFrame, contract: dict) -> list[str]:
+    errors = []
+
+    primary_keys = contract.get("primary_key", [])
+
+    if not primary_keys:
+        return errors
+
+    missing_keys = [key for key in primary_keys if key not in df.columns]
+
+    if missing_keys:
+        errors.append(f"Primary key columns missing: {missing_keys}.")
+        return errors
+
+    null_key_count = df.filter(
+        " OR ".join([f"{key} IS NULL" for key in primary_keys])
+    ).count()
+
+    if null_key_count > 0:
+        errors.append(
+            f"Primary key null check failed. "
+            f"Rows with null primary key values: {null_key_count}."
+        )
+
+    duplicate_key_count = (
+        df.groupBy(primary_keys)
+        .count()
+        .filter(col("count") > 1)
+        .count()
+    )
+
+    if duplicate_key_count > 0:
+        errors.append(
+            f"Primary key uniqueness check failed. "
+            f"Duplicate key combinations found: {duplicate_key_count}."
+        )
+
+    return errors
+
+
+def validate_data_contract(df: DataFrame, contract: dict) -> None:
+    errors = []
+
+    errors.extend(validate_schema(df, contract))
+    errors.extend(validate_date_rules(df, contract))
+    errors.extend(validate_nullable_rules(df, contract))
+    errors.extend(validate_primary_key_rules(df, contract))
 
     if errors:
         raise DataContractError(
@@ -89,8 +208,9 @@ def validate_data_contract(df: DataFrame, contract: dict) -> None:
 
 
 def apply_column_types(df: DataFrame, contract: dict) -> DataFrame:
-    column_type_map = contract.get("column_type_map", {})
+    column_type_map = get_column_type_map(contract)
     date_rules = contract.get("date_rules", {})
+    timestamp_rules = contract.get("timestamp_rules", {})
 
     for column_name, type_name in column_type_map.items():
         if column_name not in df.columns:
@@ -104,6 +224,14 @@ def apply_column_types(df: DataFrame, contract: dict) -> DataFrame:
                 column_name,
                 to_date(col(column_name).cast("string"), date_format)
             )
+
+        elif isinstance(spark_type, TimestampType):
+            timestamp_format = timestamp_rules.get(column_name, "yyyy-MM-dd HH:mm:ss")
+            df = df.withColumn(
+                column_name,
+                to_timestamp(col(column_name).cast("string"), timestamp_format)
+            )
+
         else:
             df = df.withColumn(
                 column_name,
@@ -113,37 +241,46 @@ def apply_column_types(df: DataFrame, contract: dict) -> DataFrame:
     return df
 
 
-def run_pipeline(spark, contract_path: str) -> None:
+def select_contract_columns(df: DataFrame, contract: dict) -> DataFrame:
+    expected_columns = get_expected_columns(contract)
+    return df.select(*expected_columns)
+
+
+def run_pipeline(
+    spark: SparkSession,
+    contract_path: str,
+    write_mode: str = "overwrite"
+) -> None:
+    print(f"Loading data contract: {contract_path}")
     contract = load_yaml_contract(contract_path)
 
-    source = contract["source"]
-    target = contract["target"]
-
-    source_table = f"{source['catalog']}.{source['schema']}.{source['table']}"
-    target_table = f"{target['catalog']}.{target['schema']}.{target['table']}"
-    target_schema = f"{target['catalog']}.{target['schema']}"
+    source_table = build_table_name(contract["source"])
+    target_table = build_table_name(contract["target"])
+    target_schema = build_schema_name(contract["target"])
 
     print(f"Reading source table: {source_table}")
     source_df = spark.table(source_table)
 
-    print("Running data contract checks")
+    print("Running data contract validation")
     validate_data_contract(source_df, contract)
+    print("Data contract validation passed")
 
-    print("Data contract passed")
+    print("Selecting contract columns")
+    contracted_df = select_contract_columns(source_df, contract)
 
     print("Applying target data types")
-    typed_df = apply_column_types(source_df, contract)
+    typed_df = apply_column_types(contracted_df, contract)
 
     print(f"Creating target schema if needed: {target_schema}")
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_schema}")
 
-    print(f"Writing target table: {target_table}")
+    print(f"Writing target Delta table: {target_table}")
     (
         typed_df.write
         .format("delta")
-        .mode("overwrite")
+        .mode(write_mode)
         .option("overwriteSchema", "true")
         .saveAsTable(target_table)
     )
 
-    print("Pipeline completed successfully")
+    print(f"Pipeline completed successfully: {target_table}")
